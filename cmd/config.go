@@ -140,7 +140,7 @@ func config(ctx *cli.Context) error {
 	}
 
 	originDirStats := format.DirStats
-	var quota, storage, trash, clientVer bool
+	var quota, storage, trash, clientVer, passphrase bool
 	var msg strings.Builder
 	encrypted := format.KeyEncrypted
 	for _, flag := range ctx.LocalFlagNames() {
@@ -166,7 +166,6 @@ func config(ctx *cli.Context) error {
 				storage = true
 			}
 		case "bucket":
-			// bucket will be accessed before storage, so it is necessary to determine if storage is a file
 			if new := ctx.String(flag); new != format.Bucket {
 				oldStorage := format.Storage
 				newStorage := ctx.String("storage")
@@ -187,21 +186,21 @@ func config(ctx *cli.Context) error {
 				format.AccessKey = new
 				storage = true
 			}
-		case "secret-key": // always update
+		case "secret-key":
 			msg.WriteString(fmt.Sprintf("%10s: updated\n", flag))
 			if err := format.Decrypt(); err != nil && strings.Contains(err.Error(), "secret was removed") {
 				logger.Warnf("decrypt secrets: %s", err)
 			}
 			format.SecretKey = ctx.String(flag)
 			storage = true
-		case "session-token": // always update
+		case "session-token":
 			msg.WriteString(fmt.Sprintf("%10s: updated\n", flag))
 			if err := format.Decrypt(); err != nil && strings.Contains(err.Error(), "secret was removed") {
 				logger.Warnf("decrypt secrets: %s", err)
 			}
 			format.SessionToken = ctx.String(flag)
 			storage = true
-		case "storage-class": // always update
+		case "storage-class":
 			if new := ctx.String(flag); new != format.StorageClass {
 				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, format.StorageClass, new))
 				format.StorageClass = new
@@ -261,8 +260,52 @@ func config(ctx *cli.Context) error {
 					return errors.New("cannot disable acl")
 				}
 			}
+		case "passphrase":
+			passphrase = true // Mark that passphrase update is requested
 		}
 	}
+
+	// Handle passphrase update separately
+	if passphrase {
+		if format.EncryptAlgo == "" || format.KeyEncrypted == "" {
+			return fmt.Errorf("volume does not use RSA encryption")
+		}
+		oldPassphrase := os.Getenv("JFS_RSA_PASSPHRASE_OLD")
+		newPassphrase := os.Getenv("JFS_RSA_PASSPHRASE_NEW")
+		if oldPassphrase == "" || newPassphrase == "" {
+			return fmt.Errorf("JFS_RSA_PASSPHRASE_OLD and JFS_RSA_PASSPHRASE_NEW must be set")
+		}
+
+		// Decode the encrypted RSA key
+		block, _ := pem.Decode([]byte(format.KeyEncrypted))
+		if block == nil {
+			return fmt.Errorf("failed to decode stored RSA key")
+		}
+
+		// Decrypt with old passphrase
+		decryptedKey, err := x509.DecryptPEMBlock(block, []byte(oldPassphrase))
+		if err != nil {
+			return fmt.Errorf("failed to decrypt RSA key with old passphrase: %v", err)
+		}
+
+		// Re-encrypt with new passphrase
+		newBlock, err := x509.EncryptPEMBlock(
+			rand.Reader,
+			block.Type,
+			decryptedKey,
+			[]byte(newPassphrase),
+			x509.PEMCipherAES256,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt RSA key with new passphrase: %v", err)
+		}
+		newPem := pem.EncodeToMemory(newBlock)
+
+		// Update the key in format
+		format.KeyEncrypted = string(newPem)
+		msg.WriteString(fmt.Sprintf("%10s: updated\n", "RSA passphrase"))
+	}
+
 	if msg.Len() == 0 {
 		fmt.Println("Nothing changed.")
 		return nil
@@ -319,8 +362,6 @@ func config(ctx *cli.Context) error {
 					return fmt.Errorf("Aborted.")
 				}
 			}
-
-			// check all clients
 			if sessions, err := m.ListSessions(); err == nil {
 				warnMsg := ""
 				for _, session := range sessions {
